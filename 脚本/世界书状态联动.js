@@ -5,11 +5,13 @@ const 示例对话条目后缀 = '-示例对话';
 const NSFW档案条目后缀 = '-NSFW档案';
 const 同步等待超时毫秒 = 10000;
 const 同步轮询间隔毫秒 = 100;
+const 初始堕落角色真名集合 = new Set(['芦屋道满', '莫里娅蒂娜', '乌特迦·洛奇']);
 
 let 正在同步 = false;
 let 需要再次同步 = false;
 let 待同步变量 = null;
 const 待同步来源 = new Set();
+let 最新载入同步序号 = 0;
 
 let 当前世界书缓存 = {
   名称: null,
@@ -200,6 +202,11 @@ function 从索引中查找角色(index, 角色键名, 角色数据) {
   }
 
   return null;
+}
+
+function 是初始堕落角色(roleOrTrueName) {
+  const trueName = typeof roleOrTrueName === 'string' ? roleOrTrueName : _.get(roleOrTrueName, '真名', '');
+  return 初始堕落角色真名集合.has(trueName);
 }
 
 function 合并角色记录(base, incoming) {
@@ -394,8 +401,18 @@ function 分析世界书目标(worldbook, girls) {
   const entriesByName = _.keyBy(worldbook, 'name');
   const roleIndex = 构建世界书角色索引(worldbook);
   const targetEnabledByName = new Map();
+  const 角色最终堕落状态 = new Map();
   const changedGirls = [];
   const missingGirls = [];
+
+  roleIndex.byTrueName.forEach(role => {
+    if (!角色配对完整(role)) {
+      missingGirls.push(role.真名);
+      return;
+    }
+
+    角色最终堕落状态.set(role.真名, 是初始堕落角色(role));
+  });
 
   _.forEach(girls, (girl, roleName) => {
     if (!_.isPlainObject(girl)) {
@@ -403,12 +420,25 @@ function 分析世界书目标(worldbook, girls) {
     }
 
     const role = 从索引中查找角色(roleIndex, roleName, girl);
-    if (!角色配对完整(role)) {
+    if (!role) {
       missingGirls.push(roleName);
       return;
     }
 
-    const 已堕落 = _.get(girl, '是否堕落', false) === true;
+    if (!角色配对完整(role)) {
+      missingGirls.push(role.真名);
+      return;
+    }
+
+    角色最终堕落状态.set(role.真名, _.get(girl, '是否堕落', false) === true);
+  });
+
+  roleIndex.byTrueName.forEach(role => {
+    if (!角色配对完整(role)) {
+      return;
+    }
+
+    const 已堕落 = 角色最终堕落状态.get(role.真名) === true;
     const 常态启用 = !已堕落;
     const 堕落启用 = 已堕落;
 
@@ -425,7 +455,7 @@ function 分析世界书目标(worldbook, girls) {
     const 堕落条目 = entriesByName[role.堕落条目名];
 
     if (!常态条目 || !堕落条目) {
-      missingGirls.push(roleName);
+      missingGirls.push(role.真名);
       return;
     }
 
@@ -446,18 +476,17 @@ function 分析世界书目标(worldbook, girls) {
 }
 
 async function 执行一次同步(source, candidateVariables) {
-  const variables = 是可用的Mvu变量(candidateVariables) ? candidateVariables : await 等待最新楼层变量可用();
-  if (!是可用的Mvu变量(variables)) {
-    console.warn(`${日志前缀} 跳过同步: ${source} 时未能读取最新楼层的 stat_data`);
-    return;
-  }
-
-  const girls = 获取魔法少女表(_.get(variables, 'stat_data', {}));
+  const variables = 是可用的Mvu变量(candidateVariables) ? candidateVariables : null;
+  const girls = 是可用的Mvu变量(variables) ? 获取魔法少女表(_.get(variables, 'stat_data', {})) : {};
 
   const worldbookName = 获取当前主世界书名称();
   if (!worldbookName) {
     console.warn(`${日志前缀} 跳过同步: 当前角色卡未绑定主世界书`);
     return;
+  }
+
+  if (!是可用的Mvu变量(variables)) {
+    console.info(`${日志前缀} ${source} 时未读取到最新楼层变量，按角色初始状态同步`);
   }
 
   console.info(`${日志前缀} 开始同步: ${source} -> ${worldbookName}`);
@@ -531,37 +560,63 @@ function 请求同步(source, variables) {
   })();
 }
 
-async function 纠正并回写最新变量(source) {
-  const variables = await 等待最新楼层变量可用();
+async function 纠正并回写指定变量(source, variables, cache = null) {
   if (!是可用的Mvu变量(variables)) {
-    return;
+    return false;
   }
 
-  const cache = await 刷新当前世界书缓存();
-  if (!cache.索引) {
+  const currentCache = cache ?? (await 刷新当前世界书缓存());
+  if (!currentCache.索引) {
     请求同步(source, variables);
-    return;
+    return true;
   }
 
   const draft = _.cloneDeep(variables);
-  const hasCorrection = 纠正魔法少女变量(draft, variables, cache.索引);
+  const hasCorrection = 纠正魔法少女变量(draft, variables, currentCache.索引);
 
   if (hasCorrection) {
     console.info(`${日志前缀} ${source} 时已纠正预置魔法少女变量`);
     await Mvu.replaceMvuData(draft, { type: 'message', message_id: 'latest' });
     请求同步(`${source}-纠正后`, draft);
-    return;
+    return true;
   }
 
   请求同步(source, variables);
+  return true;
+}
+
+async function 载入时同步世界书(source, forceRefreshWorldbook = false) {
+  const 本次载入同步序号 = ++最新载入同步序号;
+  const cache = await 刷新当前世界书缓存(forceRefreshWorldbook);
+  const immediateVariables = 读取最新Mvu变量();
+
+  if (await 纠正并回写指定变量(source, immediateVariables, cache)) {
+    return;
+  }
+
+  console.info(`${日志前缀} ${source} 时未读取到最新楼层变量，先按角色初始状态同步世界书`);
+  请求同步(`${source}-初始状态`);
+
+  errorCatched(async () => {
+    const delayedVariables = await 等待最新楼层变量可用();
+    if (本次载入同步序号 !== 最新载入同步序号) {
+      return;
+    }
+
+    if (!是可用的Mvu变量(delayedVariables)) {
+      console.info(`${日志前缀} ${source} 时未等到可用的最新楼层变量，保留初始状态同步结果`);
+      return;
+    }
+
+    await 纠正并回写指定变量(`${source}-晚到变量`, delayedVariables);
+  })();
 }
 
 $(() => {
   errorCatched(async () => {
     await waitGlobalInitialized('Mvu');
 
-    await 刷新当前世界书缓存();
-    await 纠正并回写最新变量('脚本加载');
+    await 载入时同步世界书('脚本加载');
 
     eventOn(Mvu.events.VARIABLE_UPDATE_ENDED, (newVariables, oldVariables) => {
       回滚AI对只读字段的修改(newVariables, oldVariables);
@@ -576,8 +631,13 @@ $(() => {
 
     eventOn(tavern_events.CHAT_CHANGED, () => {
       errorCatched(async () => {
-        await 刷新当前世界书缓存(true);
-        await 纠正并回写最新变量('切换聊天');
+        await 载入时同步世界书('切换聊天', true);
+      })();
+    });
+
+    eventOn(tavern_events.CHARACTER_PAGE_LOADED, () => {
+      errorCatched(async () => {
+        await 载入时同步世界书('载入角色卡', true);
       })();
     });
   })();
