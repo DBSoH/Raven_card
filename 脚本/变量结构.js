@@ -1,5 +1,7 @@
 import { registerMvuSchema } from 'https://testingcf.jsdelivr.net/gh/StageDog/tavern_resource/dist/util/mvu_zod.js';
 
+const 待应用命令路径队列 = [];
+
 const DEFAULT_LOCATION = {
   城市: '新都',
   地区: '未知地区',
@@ -18,6 +20,29 @@ function isRecord(value) {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
+}
+
+function normalizeCommandPath(rawPath) {
+  if (typeof rawPath !== 'string') {
+    return '';
+  }
+
+  return rawPath
+    .trim()
+    .replace(/^stat_data(?:[./]|$)/, '')
+    .replace(/^\//, '')
+    .split(/[/.]/)
+    .map(segment => segment.replace(/~1/g, '/').replace(/~0/g, '~').trim())
+    .filter(Boolean)
+    .join('.');
+}
+
+function getCommandPath(command) {
+  if (typeof command?.path === 'string') {
+    return normalizeCommandPath(command.path);
+  }
+
+  return normalizeCommandPath(command?.args?.[0]);
 }
 
 function toNumber(value, fallback) {
@@ -471,5 +496,56 @@ function normalizeRaven(rawRaven) {
 }
 
 $(() => {
-  registerMvuSchema(Schema);
+  errorCatched(async () => {
+    await waitGlobalInitialized('Mvu');
+
+    eventOn(Mvu.events.COMMAND_PARSED, commands => {
+      const touchedPaths = new Set();
+
+      commands.forEach(command => {
+        const path = getCommandPath(command);
+        if (path) {
+          touchedPaths.add(path);
+        }
+      });
+
+      待应用命令路径队列.push(touchedPaths);
+    });
+
+    eventOn(Mvu.events.VARIABLE_UPDATE_ENDED, (newVariables, oldVariables) => {
+      const touchedPaths = 待应用命令路径队列.shift() ?? new Set();
+      const newStatData = _.get(newVariables, 'stat_data');
+      const oldStatData = _.get(oldVariables, 'stat_data');
+
+      if (!isRecord(newStatData) || !isRecord(oldStatData)) {
+        return;
+      }
+
+      const oldRaven = _.get(oldStatData, '渡鸦');
+      const newRaven = _.get(newStatData, '渡鸦');
+      if (!isRecord(oldRaven) || !isRecord(newRaven)) {
+        return;
+      }
+
+      const touchedMagic = touchedPaths.has('渡鸦.魔力');
+      const touchedMaxMagic = touchedPaths.has('渡鸦.魔力上限');
+      const oldMagic = toNumber(_.get(oldRaven, '魔力'), 100);
+      const oldMaxMagic = clamp(toNumber(_.get(oldRaven, '魔力上限'), 100), 0, 999);
+      const nextMaxMagic = clamp(
+        toNumber(touchedMaxMagic ? _.get(newRaven, '魔力上限') : oldMaxMagic, oldMaxMagic),
+        0,
+        999,
+      );
+      const nextMagic = clamp(
+        toNumber(touchedMagic ? _.get(newRaven, '魔力') : oldMagic, oldMagic),
+        0,
+        nextMaxMagic,
+      );
+
+      _.set(newStatData, '渡鸦.魔力上限', nextMaxMagic);
+      _.set(newStatData, '渡鸦.魔力', nextMagic);
+    });
+
+    registerMvuSchema(Schema);
+  })();
 });
