@@ -121,7 +121,7 @@ function 解析角色条目(entry) {
   if (nsfwMatch) {
     return {
       真名: nsfwMatch[1].trim(),
-      类型: '通用',  // v1.1: NSFW档案不再区分状态，属于通用附属条目
+      类型: '通用',  // v1.1: NSFW档案不再区分状态，属于通用附属条目（不受状态联动控制）
       附属类型: 'NSFW档案',
       条目名: entry.name,
       魔法名: null,
@@ -156,7 +156,7 @@ function 角色配对完整(role) {
   );
 }
 
-// v1.1: 更新索引构建逻辑，NSFW档案作为通用附属条目
+// v1.1: 更新索引构建逻辑，NSFW档案作为通用附属条目（不受状态联动控制）
 function 构建世界书角色索引(worldbook) {
   const byTrueName = new Map();
   const byAlias = new Map();
@@ -173,14 +173,14 @@ function 构建世界书角色索引(worldbook) {
       堕落条目名: null,
       常态附属条目名: [],
       堕落附属条目名: [],
-      通用附属条目名: [],  // v1.1: 新增通用附属条目列表（如NSFW档案）
+      通用附属条目名: [],  // v1.1: 新增通用附属条目列表（如NSFW档案，不受状态联动控制）
       常态魔法名: null,
       堕落魔法名: null,
     };
 
     // v1.1: 根据类型分类处理
     if (parsed.类型 === '通用') {
-      // 通用附属条目（如NSFW档案）始终启用，不受状态影响
+      // 通用附属条目（如NSFW档案）不受状态联动控制，用户可手动开关
       if (!role.通用附属条目名.includes(parsed.条目名)) {
         role.通用附属条目名.push(parsed.条目名);
       }
@@ -452,7 +452,7 @@ function 回滚AI对只读字段的修改(newVariables, oldVariables, roleIndex 
   });
 }
 
-// v1.1: 更新分析逻辑，通用附属条目（如NSFW档案）始终启用
+// v1.1: 更新分析逻辑，通用附属条目（如NSFW档案）不受状态联动控制
 function 分析世界书目标(worldbook, girls) {
   const entriesByName = _.keyBy(worldbook, 'name');
   const roleIndex = 构建世界书角色索引(worldbook);
@@ -506,15 +506,13 @@ function 分析世界书目标(worldbook, girls) {
       targetEnabledByName.set(name, 常态启用);
     });
     
-    // v1.1: 堕落附属条目随堕落状态
+    // 堕落附属条目随堕落状态
     role.堕落附属条目名.forEach(name => {
       targetEnabledByName.set(name, 堕落启用);
     });
     
-    // v1.1: 通用附属条目（如NSFW档案）始终启用，不受状态影响
-    role.通用附属条目名.forEach(name => {
-      targetEnabledByName.set(name, true);
-    });
+    // v1.1: 通用附属条目（如NSFW档案）不受状态联动控制，不自动开启或关闭
+    // 用户可以手动开启或关闭NSFW档案
 
     const 常态条目 = entriesByName[role.常态条目名];
     const 堕落条目 = entriesByName[role.堕落条目名];
@@ -526,10 +524,8 @@ function 分析世界书目标(worldbook, girls) {
 
     const 常态附属条目需更新 = role.常态附属条目名.some(name => entriesByName[name] && entriesByName[name].enabled !== 常态启用);
     const 堕落附属条目需更新 = role.堕落附属条目名.some(name => entriesByName[name] && entriesByName[name].enabled !== 堕落启用);
-    // v1.1: 通用附属条目需更新（应该始终为启用状态）
-    const 通用附属条目需更新 = role.通用附属条目名.some(name => entriesByName[name] && entriesByName[name].enabled !== true);
 
-    if (常态条目.enabled !== 常态启用 || 堕落条目.enabled !== 堕落启用 || 常态附属条目需更新 || 堕落附属条目需更新 || 通用附属条目需更新) {
+    if (常态条目.enabled !== 常态启用 || 堕落条目.enabled !== 堕落启用 || 常态附属条目需更新 || 堕落附属条目需更新) {
       changedGirls.push(`${role.真名}:${已堕落 ? '堕落' : '常态'}`);
     }
   });
