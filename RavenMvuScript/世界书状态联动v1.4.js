@@ -1,0 +1,583 @@
+const 日志前缀 = '[世界书状态联动v1.2]';
+const 同步等待超时毫秒 = 10000;
+const 同步轮询间隔毫秒 = 100;
+const 初始堕落角色真名集合 = new Set(['芦屋道满', '莫里娅蒂娜', '乌特迦·洛奇']);
+
+let 正在同步 = false;
+let 需要再次同步 = false;
+let 待同步变量 = null;
+const 待同步来源 = new Set();
+let 最新载入同步序号 = 0;
+
+let 当前世界书缓存 = {
+  名称: null,
+  索引: null,
+};
+let 刷新世界书缓存任务 = null;
+
+// ── 工具函数 ──
+
+function 是可用的Mvu变量(variables) {
+  return _.isPlainObject(variables) && _.has(variables, 'stat_data');
+}
+
+function 是已知名称(value) {
+  return typeof value === 'string' && value.trim() && value.trim() !== '???';
+}
+
+function 获取角色别名(角色键名, 角色数据) {
+  return Array.from(
+    new Set(
+      [角色键名, _.get(角色数据, '真名'), _.get(角色数据, '魔法名')].filter(是已知名称).map(value => value.trim()),
+    ),
+  );
+}
+
+// ── 世界书条目解析（v1.2简化版：仅处理主体条目）──
+
+function 解析角色条目(entry) {
+  if (!entry || typeof entry.name !== 'string') {
+    return null;
+  }
+
+  const name = entry.name;
+
+  // 匹配: [角色] 角色名-魔法少女 或 [角色] 角色名-堕落魔法少女
+  const match = name.match(/^\[角色\]\s+(.+?)-(魔法少女|堕落魔法少女)$/);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    真名: match[1].trim(),
+    类型: match[2] === '堕落魔法少女' ? '堕落' : '常态',
+    条目名: entry.name,
+  };
+}
+
+function 角色配对完整(role) {
+  return Boolean(role && role.常态条目名 && role.堕落条目名);
+}
+
+// v1.2: 简化索引构建，仅追踪常态/堕落主体条目
+function 构建世界书角色索引(worldbook) {
+  const byTrueName = new Map();
+  const byAlias = new Map();
+
+  worldbook.forEach(entry => {
+    const parsed = 解析角色条目(entry);
+    if (!parsed) {
+      return;
+    }
+
+    const role = byTrueName.get(parsed.真名) ?? {
+      真名: parsed.真名,
+      常态条目名: null,
+      堕落条目名: null,
+    };
+
+    if (parsed.类型 === '常态') {
+      role.常态条目名 = parsed.条目名;
+    } else if (parsed.类型 === '堕落') {
+      role.堕落条目名 = parsed.条目名;
+    }
+
+    byTrueName.set(role.真名, role);
+  });
+
+  byTrueName.forEach(role => {
+    const aliases = [role.真名].filter(是已知名称);
+    aliases.forEach(alias => {
+      if (!byAlias.has(alias)) {
+        byAlias.set(alias, role);
+      }
+    });
+  });
+
+  return { byTrueName, byAlias };
+}
+
+function 从索引中查找角色(index, 角色键名, 角色数据) {
+  if (!index) {
+    return null;
+  }
+
+  const aliases = 获取角色别名(角色键名, 角色数据);
+  for (const alias of aliases) {
+    const role = index.byAlias.get(alias);
+    if (role) {
+      return role;
+    }
+  }
+
+  return null;
+}
+
+function 是初始堕落角色(roleOrTrueName) {
+  const trueName = typeof roleOrTrueName === 'string' ? roleOrTrueName : _.get(roleOrTrueName, '真名', '');
+  return 初始堕落角色真名集合.has(trueName);
+}
+
+// ── MVU变量读写 ──
+
+function 读取最新Mvu变量() {
+  try {
+    return Mvu.getMvuData({ type: 'message', message_id: 'latest' });
+  } catch {
+    return null;
+  }
+}
+
+async function 等待最新楼层变量可用(timeoutMs = 同步等待超时毫秒) {
+  const 开始时间 = Date.now();
+
+  while (Date.now() - 开始时间 < timeoutMs) {
+    const variables = 读取最新Mvu变量();
+    if (是可用的Mvu变量(variables)) {
+      return variables;
+    }
+    await new Promise(resolve => setTimeout(resolve, 同步轮询间隔毫秒));
+  }
+
+  return null;
+}
+
+function 获取魔法少女表(statData) {
+  const girls = _.get(statData, '魔法少女', {});
+  return _.isPlainObject(girls) ? girls : {};
+}
+
+// ── 世界书操作 ──
+
+function 获取当前主世界书名称() {
+  try {
+    const worldbookName = _.get(getCharWorldbookNames('current'), 'primary', null);
+    return typeof worldbookName === 'string' && worldbookName.trim() ? worldbookName : null;
+  } catch (error) {
+    console.warn(`${日志前缀} 无法读取当前角色卡绑定的主世界书`, error);
+    return null;
+  }
+}
+
+async function 刷新当前世界书缓存(force = false) {
+  const worldbookName = 获取当前主世界书名称();
+  if (!worldbookName) {
+    当前世界书缓存 = { 名称: null, 索引: null };
+    return 当前世界书缓存;
+  }
+
+  if (!force && 当前世界书缓存.名称 === worldbookName && 当前世界书缓存.索引) {
+    return 当前世界书缓存;
+  }
+
+  if (!force && 刷新世界书缓存任务) {
+    return 刷新世界书缓存任务;
+  }
+
+  刷新世界书缓存任务 = (async () => {
+    const worldbook = await getWorldbook(worldbookName);
+    当前世界书缓存 = {
+      名称: worldbookName,
+      索引: 构建世界书角色索引(worldbook),
+    };
+    return 当前世界书缓存;
+  })().finally(() => {
+    刷新世界书缓存任务 = null;
+  });
+
+  return 刷新世界书缓存任务;
+}
+
+// ── 变量纠正 ──
+
+function 规范化预置角色数据(girl, role) {
+  const nextGirl = _.cloneDeep(girl);
+  nextGirl.真名 = role.真名;
+  // 不覆盖魔法名：变量结构脚本已正确处理魔法名，世界书索引不包含魔法名映射
+  return nextGirl;
+}
+
+function 同步预置角色当前状态(girl, role, 是否堕落) {
+  if (!_.isPlainObject(girl) || !角色配对完整(role)) {
+    return;
+  }
+
+  girl.是否堕落 = 是否堕落 === true;
+  girl.真名 = role.真名;
+  // 不覆盖魔法名：变量结构脚本已正确处理魔法名，世界书索引不包含魔法名映射
+}
+
+// v1.2: 简化合并逻辑
+function 合并角色记录(base, incoming) {
+  if (!_.isPlainObject(base)) {
+    return _.cloneDeep(incoming);
+  }
+
+  const 魔力上限候选 = _.get(incoming, '魔力上限', 100);
+  const 旧魔力上限 = _.get(base, '魔力上限', 100);
+  const 魔力上限 = _.clamp(魔力上限候选 !== 100 || 旧魔力上限 === 100 ? 魔力上限候选 : 旧魔力上限, 0, 999);
+  const 魔力候选 = _.get(incoming, '魔力', 100);
+  const 旧魔力 = _.get(base, '魔力', 100);
+  const 魔力 = _.clamp(魔力候选 !== 100 || 旧魔力 === 100 ? 魔力候选 : 旧魔力, 0, 魔力上限);
+
+  return {
+    ..._.cloneDeep(base),
+    ..._.cloneDeep(incoming),
+    魔法名: 是已知名称(_.get(incoming, '魔法名')) ? incoming.魔法名 : _.get(base, '魔法名', '???'),
+    真名: 是已知名称(_.get(incoming, '真名')) ? incoming.真名 : _.get(base, '真名', '???'),
+    暴露: _.get(base, '暴露', false) === true || _.get(incoming, '暴露', false) === true,
+    对主角的态度:
+      _.get(incoming, '对主角的态度') && _.get(incoming, '对主角的态度') !== '陌生'
+        ? incoming.对主角的态度
+        : _.get(base, '对主角的态度', _.get(incoming, '对主角的态度', '陌生')),
+    是否堕落: _.get(incoming, '是否堕落', _.get(base, '是否堕落', false)) === true,
+    精神极限: _.get(base, '精神极限', false) === true || _.get(incoming, '精神极限', false) === true,
+    魔力,
+    魔力上限,
+    心结: _.cloneDeep(_.get(incoming, '心结', _.get(base, '心结', {}))),
+  };
+}
+
+function 构建纠正后的魔法少女表(newGirls, oldGirls, roleIndex) {
+  const corrected = {};
+  const 已命中的预置角色 = new Set();
+
+  _.forEach(newGirls, (girl, key) => {
+    if (!_.isPlainObject(girl)) {
+      return;
+    }
+
+    const role = 从索引中查找角色(roleIndex, key, girl);
+    if (!角色配对完整(role)) {
+      corrected[key] = 合并角色记录(corrected[key], girl);
+      return;
+    }
+
+    已命中的预置角色.add(role.真名);
+    corrected[role.真名] = 合并角色记录(corrected[role.真名], 规范化预置角色数据(girl, role));
+  });
+
+  _.forEach(oldGirls, (girl, key) => {
+    if (!_.isPlainObject(girl)) {
+      return;
+    }
+
+    const role = 从索引中查找角色(roleIndex, key, girl);
+    if (!角色配对完整(role) || 已命中的预置角色.has(role.真名)) {
+      return;
+    }
+
+    已命中的预置角色.add(role.真名);
+    corrected[role.真名] = 合并角色记录(corrected[role.真名], 规范化预置角色数据(girl, role));
+  });
+
+  return corrected;
+}
+
+function 纠正魔法少女变量(newVariables, oldVariables, roleIndex) {
+  if (!roleIndex) {
+    return false;
+  }
+
+  const statData = _.get(newVariables, 'stat_data');
+  if (!_.isPlainObject(statData)) {
+    return false;
+  }
+
+  const currentGirls = 获取魔法少女表(statData);
+  const oldGirls = 获取魔法少女表(_.get(oldVariables, 'stat_data', {}));
+  const correctedGirls = 构建纠正后的魔法少女表(currentGirls, oldGirls, roleIndex);
+
+  if (_.isEqual(correctedGirls, currentGirls)) {
+    return false;
+  }
+
+  _.set(statData, '魔法少女', correctedGirls);
+  return true;
+}
+
+// v1.2: 简化回滚逻辑 + 心结保护
+function 回滚AI对只读字段的修改(newVariables, oldVariables, roleIndex = null) {
+  const newStatData = _.get(newVariables, 'stat_data');
+  const oldStatData = _.get(oldVariables, 'stat_data');
+
+  if (!_.isPlainObject(newStatData) || !_.isPlainObject(oldStatData)) {
+    return;
+  }
+
+  const newGirls = 获取魔法少女表(newStatData);
+  const oldGirls = 获取魔法少女表(oldStatData);
+  const aliasIndex = new Map();
+
+  // 构建旧变量别名索引
+  _.forEach(oldGirls, (girl, key) => {
+    if (!_.isPlainObject(girl)) return;
+    获取角色别名(key, girl).forEach(alias => {
+      if (!aliasIndex.has(alias)) aliasIndex.set(alias, girl);
+    });
+  });
+
+  _.forEach(newGirls, (girl, key) => {
+    if (!_.isPlainObject(girl)) return;
+
+    // 先尝试从旧变量中找回对应角色数据
+    const oldGirl = _.isPlainObject(oldGirls[key])
+      ? oldGirls[key]
+      : (() => {
+          const aliases = 获取角色别名(key, girl);
+          for (const alias of aliases) {
+            const matched = aliasIndex.get(alias);
+            if (matched) return matched;
+          }
+          return null;
+        })();
+
+    if (_.isPlainObject(oldGirl)) {
+      _.set(girl, '是否堕落', _.get(oldGirl, '是否堕落', false) === true);
+      // 回滚 AI 对心结的修改：心结只能由玩家通过状态栏管理
+      _.set(girl, '心结', _.cloneDeep(_.get(oldGirl, '心结', {})));
+      return;
+    }
+
+    // 找不到旧值，使用角色卡初始状态
+    const role = 从索引中查找角色(roleIndex, key, girl);
+    if (!角色配对完整(role)) return;
+    同步预置角色当前状态(girl, role, 是初始堕落角色(role));
+    // 新出现的角色心结初始为空
+    _.set(girl, '心结', {});
+  });
+}
+
+// ── 世界书同步核心逻辑（v1.2简化版）──
+
+function 分析世界书目标(worldbook, girls) {
+  const entriesByName = _.keyBy(worldbook, 'name');
+  const roleIndex = 构建世界书角色索引(worldbook);
+  const targetEnabledByName = new Map();
+  const 角色最终堕落状态 = new Map();
+  const changedGirls = [];
+  const missingGirls = [];
+
+  // 初始化所有预置角色为初始状态
+  roleIndex.byTrueName.forEach(role => {
+    if (!角色配对完整(role)) {
+      missingGirls.push(role.真名);
+      return;
+    }
+    角色最终堕落状态.set(role.真名, 是初始堕落角色(role));
+  });
+
+  // 根据MVU变量覆写状态
+  _.forEach(girls, (girl, roleName) => {
+    if (!_.isPlainObject(girl)) return;
+
+    const role = 从索引中查找角色(roleIndex, roleName, girl);
+    if (!role) {
+      missingGirls.push(roleName);
+      return;
+    }
+
+    if (!角色配对完整(role)) {
+      missingGirls.push(role.真名);
+      return;
+    }
+
+    角色最终堕落状态.set(role.真名, _.get(girl, '是否堕落', false) === true);
+  });
+
+  // 构建目标启用状态
+  roleIndex.byTrueName.forEach(role => {
+    if (!角色配对完整(role)) return;
+
+    const 已堕落 = 角色最终堕落状态.get(role.真名) === true;
+    const 常态启用 = !已堕落;
+    const 堕落启用 = 已堕落;
+
+    targetEnabledByName.set(role.常态条目名, 常态启用);
+    targetEnabledByName.set(role.堕落条目名, 堕落启用);
+
+    const 常态条目 = entriesByName[role.常态条目名];
+    const 堕落条目 = entriesByName[role.堕落条目名];
+
+    if (!常态条目 || !堕落条目) {
+      missingGirls.push(role.真名);
+      return;
+    }
+
+    if (常态条目.enabled !== 常态启用 || 堕落条目.enabled !== 堕落启用) {
+      changedGirls.push(`${role.真名}:${已堕落 ? '堕落' : '常态'}`);
+    }
+  });
+
+  return {
+    roleIndex,
+    targetEnabledByName,
+    changedGirls,
+    missingGirls: Array.from(new Set(missingGirls)),
+  };
+}
+
+async function 执行一次同步(source, candidateVariables) {
+  const variables = 是可用的Mvu变量(candidateVariables) ? candidateVariables : null;
+  const girls = 是可用的Mvu变量(variables) ? 获取魔法少女表(_.get(variables, 'stat_data', {})) : {};
+
+  const worldbookName = 获取当前主世界书名称();
+  if (!worldbookName) {
+    console.warn(`${日志前缀} 跳过同步: 当前角色卡未绑定主世界书`);
+    return;
+  }
+
+  if (!是可用的Mvu变量(variables)) {
+    console.info(`${日志前缀} ${source} 时未读取到最新楼层变量，按角色初始状态同步`);
+  }
+
+  console.info(`${日志前缀} 开始同步: ${source} -> ${worldbookName}`);
+
+  try {
+    const worldbook = await getWorldbook(worldbookName);
+    const { roleIndex, targetEnabledByName, changedGirls, missingGirls } = 分析世界书目标(worldbook, girls);
+
+    当前世界书缓存 = {
+      名称: worldbookName,
+      索引: roleIndex,
+    };
+
+    missingGirls.forEach(roleName => {
+      console.warn(`${日志前缀} 跳过 ${roleName}: 未找到完整的 [角色] 常态/堕落条目配对`);
+    });
+
+    if (!changedGirls.length) {
+      return;
+    }
+
+    await updateWorldbookWith(
+      worldbookName,
+      entries =>
+        entries.map(entry =>
+          targetEnabledByName.has(entry.name) ? { ...entry, enabled: targetEnabledByName.get(entry.name) } : entry,
+        ),
+      { render: 'debounced' },
+    );
+
+    console.info(`${日志前缀} 已更新角色条目: ${changedGirls.join(', ')}`);
+  } catch (error) {
+    console.warn(`${日志前缀} 同步世界书失败: ${worldbookName}`, error);
+  }
+}
+
+function 请求同步(source, variables) {
+  待同步来源.add(source);
+  if (是可用的Mvu变量(variables)) {
+    待同步变量 = variables;
+  }
+
+  if (正在同步) {
+    需要再次同步 = true;
+    return;
+  }
+
+  正在同步 = true;
+
+  errorCatched(async () => {
+    try {
+      do {
+        需要再次同步 = false;
+
+        const sourceText = Array.from(待同步来源).join('、') || source;
+        const nextVariables = 待同步变量;
+
+        待同步来源.clear();
+        待同步变量 = null;
+
+        await 执行一次同步(sourceText, nextVariables);
+      } while (需要再次同步 || 待同步来源.size > 0);
+    } finally {
+      正在同步 = false;
+    }
+  })();
+}
+
+async function 纠正并回写指定变量(source, variables, cache = null) {
+  if (!是可用的Mvu变量(variables)) {
+    return false;
+  }
+
+  const currentCache = cache ?? (await 刷新当前世界书缓存());
+  if (!currentCache.索引) {
+    请求同步(source, variables);
+    return true;
+  }
+
+  const draft = _.cloneDeep(variables);
+  const hasCorrection = 纠正魔法少女变量(draft, variables, currentCache.索引);
+
+  if (hasCorrection) {
+    console.info(`${日志前缀} ${source} 时已纠正预置魔法少女变量`);
+    await Mvu.replaceMvuData(draft, { type: 'message', message_id: 'latest' });
+    请求同步(`${source}-纠正后`, draft);
+    return true;
+  }
+
+  请求同步(source, variables);
+  return true;
+}
+
+async function 载入时同步世界书(source, forceRefreshWorldbook = false) {
+  const 本次载入同步序号 = ++最新载入同步序号;
+  const cache = await 刷新当前世界书缓存(forceRefreshWorldbook);
+  const immediateVariables = 读取最新Mvu变量();
+
+  if (await 纠正并回写指定变量(source, immediateVariables, cache)) {
+    return;
+  }
+
+  console.info(`${日志前缀} ${source} 时未读取到最新楼层变量，先按角色初始状态同步世界书`);
+  请求同步(`${source}-初始状态`);
+
+  errorCatched(async () => {
+    const delayedVariables = await 等待最新楼层变量可用();
+    if (本次载入同步序号 !== 最新载入同步序号) {
+      return;
+    }
+
+    if (!是可用的Mvu变量(delayedVariables)) {
+      console.info(`${日志前缀} ${source} 时未等到可用的最新楼层变量，保留初始状态同步结果`);
+      return;
+    }
+
+    await 纠正并回写指定变量(`${source}-晚到变量`, delayedVariables);
+  })();
+}
+
+// ── 入口 ──
+
+$(() => {
+  errorCatched(async () => {
+    await waitGlobalInitialized('Mvu');
+
+    await 载入时同步世界书('脚本加载');
+
+    eventOn(Mvu.events.VARIABLE_UPDATE_ENDED, (newVariables, oldVariables) => {
+      const roleIndex = _.get(当前世界书缓存, '索引', null);
+      回滚AI对只读字段的修改(newVariables, oldVariables, roleIndex);
+
+      if (roleIndex) {
+        纠正魔法少女变量(newVariables, oldVariables, roleIndex);
+      }
+
+      请求同步('变量更新结束', newVariables);
+    });
+
+    eventOn(tavern_events.CHAT_CHANGED, () => {
+      errorCatched(async () => {
+        await 载入时同步世界书('切换聊天', true);
+      })();
+    });
+
+    eventOn(tavern_events.CHARACTER_PAGE_LOADED, () => {
+      errorCatched(async () => {
+        await 载入时同步世界书('载入角色卡', true);
+      })();
+    });
+  })();
+});
