@@ -45,8 +45,8 @@ function 解析角色条目(entry) {
   };
 }
 
-function 角色配对完整(role) {
-  return Boolean(role && role.常态条目名 && role.堕落条目名);
+function 角色条目存在(role) {
+  return Boolean(role && (role.常态条目名 || role.堕落条目名));
 }
 
 function 构建世界书角色索引(worldbook) {
@@ -172,7 +172,7 @@ function 规范化预置角色数据(girl, role) {
 }
 
 function 同步预置角色当前状态(girl, role, 是否堕落) {
-  if (!_.isPlainObject(girl) || !角色配对完整(role)) {
+  if (!_.isPlainObject(girl) || !角色条目存在(role)) {
     return;
   }
 
@@ -219,7 +219,7 @@ function 构建纠正后的魔法少女表(newGirls, oldGirls, roleIndex) {
     }
 
     const role = 从索引中查找角色(roleIndex, key, girl);
-    if (!角色配对完整(role)) {
+    if (!角色条目存在(role)) {
       corrected[key] = 合并角色记录(corrected[key], girl);
       return;
     }
@@ -234,7 +234,7 @@ function 构建纠正后的魔法少女表(newGirls, oldGirls, roleIndex) {
     }
 
     const role = 从索引中查找角色(roleIndex, key, girl);
-    if (!角色配对完整(role) || 已命中的预置角色.has(role.真名)) {
+    if (!角色条目存在(role) || 已命中的预置角色.has(role.真名)) {
       return;
     }
 
@@ -312,15 +312,16 @@ function 回滚AI对只读字段的修改(newVariables, oldVariables, roleIndex 
         })();
 
     if (_.isPlainObject(oldGirl)) {
-      // 回滚 AI 对只读字段的修改：是否堕落、心结只能由玩家通过状态栏管理
+      // 回滚 AI 对只读字段的修改：是否堕落、心结、魔法名只能由玩家通过状态栏管理
       _.set(girl, '是否堕落', _.get(oldGirl, '是否堕落', false) === true);
       _.set(girl, '心结', _.cloneDeep(_.get(oldGirl, '心结', {})));
+      _.set(girl, '魔法名', _.get(oldGirl, '魔法名', '???'));
       return;
     }
 
     // 找不到旧值，使用角色卡初始状态
     const role = 从索引中查找角色(roleIndex, key, girl);
-    if (!角色配对完整(role)) return;
+    if (!角色条目存在(role)) return;
     同步预置角色当前状态(girl, role, 是初始堕落角色(role));
     // 新出现的角色心结初始为空
     _.set(girl, '心结', {});
